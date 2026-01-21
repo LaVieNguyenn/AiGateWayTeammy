@@ -646,6 +646,53 @@ Schema:
 });
 
 // ======================================================================
+// LLM: Project Management Assistant — Phase A (Draft, NO side effects)
+// - Input: { userText, facts?, preferences? }
+// - Output JSON (assistant response + draft JSON). No external side effects.
+// ======================================================================
+app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactory hf) =>
+{
+    if (!Authorized(req)) return Results.Unauthorized();
+
+    var rawRequest = await ReadBodyAsync(req);
+    using var doc = JsonDocument.Parse(rawRequest);
+    var root = doc.RootElement;
+
+    var userText = (GetStringAny(root, "userText", "message", "Message", "text", "Text") ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(userText))
+        return Results.BadRequest(new { error = "Missing userText" });
+
+    var sys = BuildPmAssistantDraftSystemPrompt();
+    var userObj = new
+    {
+        userText,
+        rules = new
+        {
+            noSideEffects = true,
+            askMaxQuestions = 3,
+            defaultMode = "backlog-first",
+            descriptionPreferred = true
+        }
+    };
+
+    var user = JsonSerializer.Serialize(userObj, JsonOpts());
+    var llm = hf.CreateClient("llm");
+    var (ok, json, detail) = await CallJsonWithRetryAsync(llm, llmModel, sys, user, llmGate, req.HttpContext.RequestAborted);
+    if (!ok)
+        return Results.Ok(new { error = "llm_invalid_json_or_incomplete", detail, draft = (object?)null });
+
+    if (!TryParseJson(json!, out var parsed, out var perr))
+        return Results.Ok(new { error = "llm_invalid_json", detail = perr, draft = (object?)null });
+
+    var outRoot = parsed!.RootElement;
+    if (outRoot.ValueKind != JsonValueKind.Object)
+        return Results.Ok(new { error = "llm_invalid_or_missing_fields", detail = "root_not_object", draft = (object?)null });
+
+    // We don't content-rewrite here; just return the model JSON.
+    return Results.Content(outRoot.GetRawText(), "application/json", Encoding.UTF8);
+});
+
+// ======================================================================
 // LLM: Rerank (topic / group_post / personal_post)
 // - mode=topic => ABSOLUTE score mapping
 // - mode=group_post/personal_post => RELATIVE score mapping (min-max in batch)
@@ -2289,6 +2336,51 @@ static async Task<(bool ok, string? json, object detail)> CallJsonWithRetryAsync
         ,
         attempt3 = new { finish = c3.finish, preview = Clip(c3.content, 600) }
     });
+}
+
+static string BuildPmAssistantDraftSystemPrompt()
+{
+        // Keep it strict: one JSON object only.
+        return """
+You are Teammy Project-Management AI Assistant.
+
+You must follow:
+- NO SIDE EFFECTS. You only generate a DRAFT.
+- Do NOT invent facts. Use only the provided JSON facts.
+- If missing critical info, ask at most 1–3 short questions.
+- If user does not specify mode, default to: backlog-first.
+- Prefer putting details into the field `draft.description` (string) when available.
+
+Return ONE JSON object with EXACTLY these top-level keys:
+- answerText: string
+- questions: string[]
+- draft: object
+
+Schema for `draft` (must include these keys):
+{
+    "mode": "auto" | "backlog-first" | "task-first",
+    "title": string,
+    "type": "bug" | "feature" | "chore",
+    "priority": string | null,
+    "description": string,
+    "reproSteps": string[],
+    "debugPlan": string[],
+    "testChecklist": string[],
+    "acceptanceCriteria": string[],
+    "suggestedActions": string[],
+    "milestoneId": string | null,
+    "columnId": string | null,
+    "assigneeIds": string[] | null,
+    "dedupeDecision": "create_new" | "update_existing" | "ignore" | null,
+    "dedupeTarget": { "taskId": string | null, "backlogItemId": string | null } | null
+}
+
+Content rules:
+- `title` <= 80 chars.
+- `description` should include: context / observed / expected / impact (brief). If no bug, adapt appropriately.
+- If you asked questions, still output a best-effort draft (may contain nulls).
+- Do NOT include any extra keys beyond the schema above.
+""";
 }
 
 // ======================================================================
