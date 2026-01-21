@@ -861,7 +861,13 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
                 var title = string.IsNullOrWhiteSpace(extractedTitle) ? "New task (needs title)" : extractedTitle!;
                 if (string.IsNullOrWhiteSpace(extractedTitle))
                     questions.Add("What is the task title?");
-                questions.Add("Any details for the description (expected outcome, acceptance criteria, assignees, due date)?");
+                if (MentionsNewMilestone(userText))
+                    questions.Add("What should the new milestone be named? (You can rename my suggestion)");
+                questions.Add("Any extra details (assignees, priority, due date)?");
+
+                var milestoneName = MentionsNewMilestone(userText)
+                    ? (string.IsNullOrWhiteSpace(extractedTitle) ? "Design" : $"{title} milestone")
+                    : null;
 
                 draftObj = new
                 {
@@ -869,11 +875,13 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
                     actionPayload = new
                     {
                         title,
-                        description = $"Context: {userText}",
+                        description = GenerateTaskDescriptionFromTitle(title),
                         priority = (string?)null,
                         dueDate = (string?)null,
                         milestoneId = (string?)null,
-                        milestoneName = (string?)null,
+                        milestoneName,
+                        milestoneDescription = (string?)null,
+                        milestoneTargetDate = (string?)null,
                         columnId = (string?)null,
                         columnName = (string?)null,
                         assigneeIds = (string[]?)null,
@@ -2559,6 +2567,11 @@ Return ONE JSON object with EXACTLY these top-level keys:
 - questions: string[]
 - draft: object | null
 
+Important input hygiene:
+- The input message may include metadata lines like "TODAY_UTC: YYYY-MM-DD" and/or blocks like "CURRENT_DRAFT_JSON:".
+- These are NOT part of the user's requested title/description.
+- NEVER copy these metadata lines verbatim into `draft.actionPayload.title` or `draft.actionPayload.description`.
+
 Chatbox rule:
 - If the user message is non-actionable chat (e.g. greetings, "who are you", general questions), set `draft` to null.
 - In that case, `answerText` MUST directly answer the user (never empty). `questions` should be empty unless you truly need clarification.
@@ -2606,6 +2619,15 @@ Common rules for `actionPayload`:
 - Prefer including names/titles when IDs are unknown.
 - Keep payload minimal: only fields needed for the action.
 
+Title/description extraction (VERY IMPORTANT):
+- If user says "create a task about X" or "create a task to X", set title to a short, clean summary of X (2–8 words), NOT the full sentence.
+- If the user did not provide a real description, you MUST generate a helpful, concrete description based on the user's intent (do NOT just echo the request text).
+    Prefer 3–6 short bullet lines: deliverable + scope + key steps + acceptance criteria.
+- If the user asks to put the task into a NEW milestone and does not name it, you MUST:
+    - set `milestoneName` to a best-effort suggested name (derived from the task, e.g. "Design Docs" or "Architecture")
+    - ask 1 short question to confirm/rename the milestone
+- If the user mentions a milestone target date, include `milestoneTargetDate` (YYYY-MM-DD) in addition to `milestoneName`.
+
 Action selection hints (VERY IMPORTANT):
 - If user says "move" / "di chuyển" and mentions source/target columns (e.g., "from To Do to In Progress"), you MUST choose `move_task`.
 - If user says "add comment" / "bình luận" -> `add_comment`.
@@ -2635,6 +2657,8 @@ create_backlog_and_task:
     "dueDate": string | null,
     "milestoneId": string | null,
     "milestoneName": string | null,
+    "milestoneDescription": string | null,
+    "milestoneTargetDate": string | null,
     "columnId": string | null,
     "columnName": string | null,
     "assigneeIds": string[] | null,
@@ -2928,6 +2952,34 @@ static string? TryExtractTitleFromMessage(string text)
     if (aboutIdx >= 0)
     {
         var title = t[(aboutIdx + " about ".Length)..].Trim();
+
+        // Trim common trailing clauses that are not part of the task title.
+        var tl = title.ToLowerInvariant();
+        var cutPhrases = new[]
+        {
+            " and put it into ",
+            " and put into ",
+            " and add it to ",
+            " and assign it to ",
+            " into a new milestone",
+            " into new milestone",
+            " to a new milestone",
+            " to new milestone",
+            " in a new milestone",
+            " in new milestone",
+        };
+        foreach (var p in cutPhrases)
+        {
+            var idx = tl.IndexOf(p, StringComparison.Ordinal);
+            if (idx > 0)
+            {
+                title = title[..idx].Trim();
+                break;
+            }
+        }
+
+        // Also trim trailing quotes if user pasted one.
+        title = title.Trim().Trim('"', '\'', '“', '”');
         if (title.Length > 0)
             return title.Trim().TrimEnd('.', '!', '?');
     }
@@ -2937,11 +2989,35 @@ static string? TryExtractTitleFromMessage(string text)
     if (veIdx >= 0)
     {
         var title = t[(veIdx + " về ".Length)..].Trim();
+        title = title.Trim().Trim('"', '\'', '“', '”');
         if (title.Length > 0)
             return title.Trim().TrimEnd('.', '!', '?');
     }
 
     return null;
+}
+
+static bool MentionsNewMilestone(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    var t = text.Trim().ToLowerInvariant();
+    return (t.Contains("new milestone") || t.Contains("create a milestone") || t.Contains("create milestone"))
+           || (t.Contains("milestone") && (t.Contains("new") || t.Contains("create")))
+           || (t.Contains("tạo milestone") || t.Contains("tao milestone") || t.Contains("milestone mới") || t.Contains("milestone moi"));
+}
+
+static string GenerateTaskDescriptionFromTitle(string title)
+{
+    var clean = (title ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(clean))
+        return "Define the task deliverable and acceptance criteria.";
+
+    // Keep it concise but useful (works even when LLM fallback is used).
+    return $"Deliverable: produce a clear class diagram for {clean}.\n" +
+           "- Identify key entities/classes and relationships (association, inheritance, composition).\n" +
+           "- Include main attributes/methods at a high level (no over-detail).\n" +
+           "- Export diagram (PNG/PDF) and attach source file (draw.io/PlantUML).\n" +
+           "Acceptance: diagram is readable, consistent naming, and covers core domain objects.";
 }
 
 // ======================================================================
