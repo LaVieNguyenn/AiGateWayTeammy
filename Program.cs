@@ -753,6 +753,44 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
     if (!dict.TryGetValue("draft", out var dEl) || (dEl.ValueKind != JsonValueKind.Object && dEl.ValueKind != JsonValueKind.Null))
         dict["draft"] = JsonNull();
 
+    // If user intent is clearly actionable but model returned draft:null, synthesize a minimal draft.
+    if (IsCreateOrUpdateIntent(userText)
+        && dict.TryGetValue("draft", out var curDraft)
+        && curDraft.ValueKind == JsonValueKind.Null)
+    {
+        var extractedTitle = TryExtractTitleFromMessage(userText);
+        var title = string.IsNullOrWhiteSpace(extractedTitle) ? "New task (needs title)" : extractedTitle!;
+
+        var questions = new List<string>();
+        if (string.IsNullOrWhiteSpace(extractedTitle))
+            questions.Add("What is the task title?");
+        questions.Add("Any details for the description (expected outcome, acceptance criteria, assignees, due date)?");
+
+        dict["questions"] = JsonSerializer.SerializeToElement(questions.Take(3).ToArray());
+
+        var draftObj = new
+        {
+            mode = "backlog-first",
+            title,
+            type = "feature",
+            priority = (string?)null,
+            description = $"Context: {userText}",
+            reproSteps = Array.Empty<string>(),
+            debugPlan = Array.Empty<string>(),
+            testChecklist = Array.Empty<string>(),
+            acceptanceCriteria = Array.Empty<string>(),
+            suggestedActions = Array.Empty<string>(),
+            milestoneId = (string?)null,
+            columnId = (string?)null,
+            assigneeIds = (string[]?)null,
+            dedupeDecision = (string?)null,
+            dedupeTarget = (object?)null
+        };
+
+        dict["draft"] = JsonSerializer.SerializeToElement(draftObj, JsonOpts());
+        dict["answerText"] = JsonSerializer.SerializeToElement("Got it. I drafted a task for you—please review/edit the draft and confirm to commit.");
+    }
+
     return Results.Content(JsonSerializer.Serialize(dict, JsonOpts()), "application/json", Encoding.UTF8);
 });
 
@@ -2415,6 +2453,8 @@ You must follow:
 - Only propose creating/updating a work item if the user message is clearly about project work (tasks/backlog/bugs/features).
 - If the user asks about topics outside Teammy project management, refuse briefly and ask them to ask about Teammy tasks/backlog/board.
 - Prefer putting details into the field `draft.description` (string) when available.
+- Do NOT claim that you already created/updated anything. This is Phase A draft only.
+- Do NOT promise timelines (e.g., "next sprint") or outcomes.
 
 Return ONE JSON object with EXACTLY these top-level keys:
 - answerText: string
@@ -2425,6 +2465,10 @@ Chatbox rule:
 - If the user message is non-actionable chat (e.g. greetings, "who are you", general questions), set `draft` to null.
 - In that case, `answerText` MUST directly answer the user (never empty). `questions` should be empty unless you truly need clarification.
 - Do NOT ask "Do you want me to create a task?" for identity/greeting/general questions.
+
+Action rule:
+- If the user explicitly asks to create/update a task/backlog item (e.g. "create a task", "add a task", "update task"), then `draft` MUST be a non-null object.
+- If title/details are missing, include 1-3 questions and still output a best-effort draft using a placeholder title like "New task (needs title)".
 
 Draft rule:
 - If the user intent IS actionable, create `draft` and (if mode is not specified) set draft.mode to "backlog-first".
@@ -2504,6 +2548,61 @@ static bool IsAssistantMetaQuestion(string text)
            || t.Contains("ban la ai", StringComparison.Ordinal)
            || t.Contains("bạn làm được gì", StringComparison.Ordinal)
            || t.Contains("ban lam duoc gi", StringComparison.Ordinal);
+}
+
+static bool IsCreateOrUpdateIntent(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    var t = text.ToLowerInvariant();
+
+    // English
+    if (t.Contains("create a task") || t.Contains("create task") || t.Contains("add a task") || t.Contains("new task")
+        || t.Contains("update task") || t.Contains("edit task") || t.Contains("create a backlog") || t.Contains("backlog item"))
+        return true;
+
+    // Vietnamese (basic)
+    if (t.Contains("tạo task") || t.Contains("tao task") || t.Contains("tạo công việc") || t.Contains("tao cong viec")
+        || t.Contains("thêm task") || t.Contains("them task") || t.Contains("tạo backlog") || t.Contains("tao backlog")
+        || t.Contains("cập nhật task") || t.Contains("cap nhat task") || t.Contains("sửa task") || t.Contains("sua task"))
+        return true;
+
+    return false;
+}
+
+static string? TryExtractTitleFromMessage(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return null;
+    var t = text.Trim();
+
+    // Prefer quoted titles
+    var q1 = t.IndexOf('"');
+    if (q1 >= 0)
+    {
+        var q2 = t.IndexOf('"', q1 + 1);
+        if (q2 > q1 + 1)
+            return t.Substring(q1 + 1, q2 - q1 - 1).Trim().TrimEnd('.', '!', '?');
+    }
+
+    // Simple "about ..." heuristic
+    var lower = t.ToLowerInvariant();
+    var aboutIdx = lower.IndexOf(" about ", StringComparison.Ordinal);
+    if (aboutIdx >= 0)
+    {
+        var title = t[(aboutIdx + " about ".Length)..].Trim();
+        if (title.Length > 0)
+            return title.Trim().TrimEnd('.', '!', '?');
+    }
+
+    // Vietnamese "về ..." heuristic
+    var veIdx = lower.IndexOf(" về ", StringComparison.Ordinal);
+    if (veIdx >= 0)
+    {
+        var title = t[(veIdx + " về ".Length)..].Trim();
+        if (title.Length > 0)
+            return title.Trim().TrimEnd('.', '!', '?');
+    }
+
+    return null;
 }
 
 // ======================================================================
