@@ -754,7 +754,7 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
         dict["draft"] = JsonNull();
 
     // If user intent is clearly actionable but model returned draft:null, synthesize a minimal draft.
-    if (IsCreateOrUpdateIntent(userText)
+    if (IsActionableIntent(userText)
         && dict.TryGetValue("draft", out var curDraft)
         && curDraft.ValueKind == JsonValueKind.Null)
     {
@@ -770,25 +770,24 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
 
         var draftObj = new
         {
-            mode = "backlog-first",
-            title,
-            type = "feature",
-            priority = (string?)null,
-            description = $"Context: {userText}",
-            reproSteps = Array.Empty<string>(),
-            debugPlan = Array.Empty<string>(),
-            testChecklist = Array.Empty<string>(),
-            acceptanceCriteria = Array.Empty<string>(),
-            suggestedActions = Array.Empty<string>(),
-            milestoneId = (string?)null,
-            columnId = (string?)null,
-            assigneeIds = (string[]?)null,
-            dedupeDecision = (string?)null,
-            dedupeTarget = (object?)null
+            actionType = "create_backlog_and_task",
+            actionPayload = new
+            {
+                title,
+                description = $"Context: {userText}",
+                priority = (string?)null,
+                dueDate = (string?)null,
+                milestoneId = (string?)null,
+                milestoneName = (string?)null,
+                columnId = (string?)null,
+                columnName = (string?)null,
+                assigneeIds = (string[]?)null,
+                assigneeNames = (string[]?)null
+            }
         };
 
         dict["draft"] = JsonSerializer.SerializeToElement(draftObj, JsonOpts());
-        dict["answerText"] = JsonSerializer.SerializeToElement("Got it. I drafted a task for you—please review/edit the draft and confirm to commit.");
+        dict["answerText"] = JsonSerializer.SerializeToElement("Got it. I drafted an action for you—please review/edit it and confirm to commit.");
     }
 
     return Results.Content(JsonSerializer.Serialize(dict, JsonOpts()), "application/json", Encoding.UTF8);
@@ -2442,8 +2441,8 @@ static async Task<(bool ok, string? json, object detail)> CallJsonWithRetryAsync
 
 static string BuildPmAssistantDraftSystemPrompt()
 {
-        // Keep it strict: one JSON object only.
-        return """
+    // Keep it strict: one JSON object only.
+    return """
 You are Teammy Project-Management AI Assistant.
 
 You must follow:
@@ -2467,36 +2466,151 @@ Chatbox rule:
 - Do NOT ask "Do you want me to create a task?" for identity/greeting/general questions.
 
 Action rule:
-- If the user explicitly asks to create/update a task/backlog item (e.g. "create a task", "add a task", "update task"), then `draft` MUST be a non-null object.
-- If title/details are missing, include 1-3 questions and still output a best-effort draft using a placeholder title like "New task (needs title)".
+- If the user explicitly asks to do a Teammy PM action (create/update/delete/move task, manage backlog, manage milestones, assign/remove milestone items, add/delete comment, replace assignees), then `draft` MUST be a non-null object.
+- If critical fields are missing (e.g., which task/milestone), include 1–3 questions and still output a best-effort draft.
+- You MUST NOT invent IDs. Use null for unknown IDs.
 
-Draft rule:
-- If the user intent IS actionable, create `draft` and (if mode is not specified) set draft.mode to "backlog-first".
+Draft schema:
 
-Schema for `draft` (when draft is not null, it MUST include these keys):
+When `draft` is not null, it MUST be an object with EXACTLY these keys:
 {
-    "mode": "auto" | "backlog-first" | "task-first",
-    "title": string,
-    "type": "bug" | "feature" | "chore",
-    "priority": string | null,
-    "description": string,
-    "reproSteps": string[],
-    "debugPlan": string[],
-    "testChecklist": string[],
-    "acceptanceCriteria": string[],
-    "suggestedActions": string[],
-    "milestoneId": string | null,
-    "columnId": string | null,
-    "assigneeIds": string[] | null,
-    "dedupeDecision": "create_new" | "update_existing" | "ignore" | null,
-    "dedupeTarget": { "taskId": string | null, "backlogItemId": string | null } | null
+    "actionType": string,
+    "actionPayload": object
 }
+
+Allowed `actionType` values:
+- create_backlog_and_task
+- create_task
+- update_task
+- delete_task
+- move_task
+- replace_assignees
+- add_comment
+- delete_comment
+
+- create_backlog_item
+- update_backlog_item
+- archive_backlog_item
+- promote_backlog_item
+
+- create_milestone
+- update_milestone
+- delete_milestone
+- assign_milestone_items
+- remove_milestone_item
+- extend_milestone
+- move_milestone_tasks
+
+Common rules for `actionPayload`:
+- Never claim you looked up data.
+- Never invent IDs. Any *Id field MUST be either a string GUID or null.
+- Prefer including names/titles when IDs are unknown.
+- Keep payload minimal: only fields needed for the action.
+
+Payload shapes (best-effort; unknown IDs = null):
+
+create_backlog_and_task:
+{
+    "title": string,
+    "description": string | null,
+    "priority": string | null,
+    "dueDate": string | null,
+    "milestoneId": string | null,
+    "milestoneName": string | null,
+    "columnId": string | null,
+    "columnName": string | null,
+    "assigneeIds": string[] | null,
+    "assigneeNames": string[] | null
+}
+
+create_task:
+{
+    "title": string,
+    "description": string | null,
+    "priority": string | null,
+    "status": string | null,
+    "dueDate": string | null,
+    "columnId": string | null,
+    "columnName": string | null,
+    "assigneeIds": string[] | null,
+    "assigneeNames": string[] | null,
+    "backlogItemId": string | null,
+    "backlogTitle": string | null
+}
+
+update_task:
+{
+    "taskId": string | null,
+    "taskTitle": string | null,
+    "title": string | null,
+    "description": string | null,
+    "priority": string | null,
+    "status": string | null,
+    "dueDate": string | null,
+    "columnId": string | null,
+    "columnName": string | null,
+    "assigneeIds": string[] | null,
+    "assigneeNames": string[] | null
+}
+
+delete_task:
+{ "taskId": string | null, "taskTitle": string | null }
+
+move_task:
+{
+    "taskId": string | null,
+    "taskTitle": string | null,
+    "targetColumnId": string | null,
+    "targetColumnName": string | null,
+    "prevTaskId": string | null,
+    "nextTaskId": string | null
+}
+
+replace_assignees:
+{ "taskId": string | null, "taskTitle": string | null, "assigneeIds": string[] | null, "assigneeNames": string[] | null }
+
+add_comment:
+{ "taskId": string | null, "taskTitle": string | null, "content": string }
+
+delete_comment:
+{ "commentId": string | null }
+
+create_backlog_item:
+{ "title": string, "description": string | null, "priority": string | null, "category": string | null, "storyPoints": int | null, "dueDate": string | null, "ownerUserId": string | null, "ownerName": string | null }
+
+update_backlog_item:
+{ "backlogItemId": string | null, "backlogTitle": string | null, "title": string | null, "description": string | null, "priority": string | null, "category": string | null, "storyPoints": int | null, "dueDate": string | null, "status": string | null, "ownerUserId": string | null, "ownerName": string | null }
+
+archive_backlog_item:
+{ "backlogItemId": string | null, "backlogTitle": string | null }
+
+promote_backlog_item:
+{ "backlogItemId": string | null, "backlogTitle": string | null, "columnId": string | null, "columnName": string | null, "taskStatus": string | null, "taskDueDate": string | null }
+
+create_milestone:
+{ "name": string, "description": string | null, "targetDate": string | null }
+
+update_milestone:
+{ "milestoneId": string | null, "milestoneName": string | null, "name": string | null, "description": string | null, "targetDate": string | null, "status": string | null, "completedAt": string | null }
+
+delete_milestone:
+{ "milestoneId": string | null, "milestoneName": string | null }
+
+assign_milestone_items:
+{ "milestoneId": string | null, "milestoneName": string | null, "backlogItemIds": string[] | null, "backlogTitles": string[] | null }
+
+remove_milestone_item:
+{ "milestoneId": string | null, "milestoneName": string | null, "backlogItemId": string | null, "backlogTitle": string | null }
+
+extend_milestone:
+{ "milestoneId": string | null, "milestoneName": string | null, "newTargetDate": string }
+
+move_milestone_tasks:
+{ "milestoneId": string | null, "targetMilestoneId": string | null, "createNewMilestone": bool, "newMilestoneName": string | null, "newMilestoneTargetDate": string | null, "newMilestoneDescription": string | null }
 
 Content rules:
 - `answerText` MUST be non-empty.
-- `title` <= 80 chars.
-- `description` should include: context / observed / expected / impact (brief). If no bug, adapt appropriately.
-- If you asked questions, still output a best-effort draft (may contain nulls).
+- If you asked questions, still output a best-effort draft (may contain nulls in IDs).
 - Do NOT include any extra keys beyond the schema above.
 """;
 }
@@ -2550,20 +2664,31 @@ static bool IsAssistantMetaQuestion(string text)
            || t.Contains("ban lam duoc gi", StringComparison.Ordinal);
 }
 
-static bool IsCreateOrUpdateIntent(string text)
+static bool IsActionableIntent(string text)
 {
     if (string.IsNullOrWhiteSpace(text)) return false;
     var t = text.ToLowerInvariant();
 
     // English
     if (t.Contains("create a task") || t.Contains("create task") || t.Contains("add a task") || t.Contains("new task")
-        || t.Contains("update task") || t.Contains("edit task") || t.Contains("create a backlog") || t.Contains("backlog item"))
+        || t.Contains("update task") || t.Contains("edit task") || t.Contains("delete task") || t.Contains("remove task")
+        || t.Contains("move task") || t.Contains("move card")
+        || t.Contains("add comment") || t.Contains("comment")
+        || t.Contains("assignee") || t.Contains("assign")
+        || t.Contains("create backlog") || t.Contains("backlog item") || t.Contains("update backlog") || t.Contains("archive backlog") || t.Contains("promote backlog")
+        || t.Contains("milestone") || t.Contains("create milestone") || t.Contains("update milestone") || t.Contains("delete milestone") || t.Contains("extend milestone"))
         return true;
 
     // Vietnamese (basic)
     if (t.Contains("tạo task") || t.Contains("tao task") || t.Contains("tạo công việc") || t.Contains("tao cong viec")
-        || t.Contains("thêm task") || t.Contains("them task") || t.Contains("tạo backlog") || t.Contains("tao backlog")
-        || t.Contains("cập nhật task") || t.Contains("cap nhat task") || t.Contains("sửa task") || t.Contains("sua task"))
+        || t.Contains("thêm task") || t.Contains("them task")
+        || t.Contains("cập nhật task") || t.Contains("cap nhat task") || t.Contains("sửa task") || t.Contains("sua task")
+        || t.Contains("xoá task") || t.Contains("xoa task") || t.Contains("xóa task")
+        || t.Contains("di chuyển") || t.Contains("di chuyen") || t.Contains("move")
+        || t.Contains("bình luận") || t.Contains("binh luan") || t.Contains("comment")
+        || t.Contains("phân công") || t.Contains("phan cong") || t.Contains("giao")
+        || t.Contains("tạo backlog") || t.Contains("tao backlog") || t.Contains("cập nhật backlog") || t.Contains("cap nhat backlog")
+        || t.Contains("milestone") || t.Contains("mốc") || t.Contains("moc") || t.Contains("tạo milestone") || t.Contains("tao milestone"))
         return true;
 
     return false;
