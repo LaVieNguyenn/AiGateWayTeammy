@@ -671,6 +671,19 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
     if (string.IsNullOrWhiteSpace(userText))
         return Results.BadRequest(new { error = "Missing userText" });
 
+    // Allow assistant meta questions even in project-only mode.
+    if (pmAssistantProjectOnly && IsAssistantMetaQuestion(userText))
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["answerText"] = "I'm Teammy, your AI project-management assistant for this app. I help create/update tasks and backlog items, move cards, and draft work details.",
+            ["questions"] = new[] { pmAssistantOutOfScopeQuestion },
+            ["draft"] = null
+        };
+
+        return Results.Content(JsonSerializer.Serialize(payload, JsonOpts()), "application/json", Encoding.UTF8);
+    }
+
     if (pmAssistantProjectOnly && !IsProjectScopedIntent(userText))
     {
         var payload = new Dictionary<string, object?>
@@ -2475,6 +2488,22 @@ static bool IsProjectScopedIntent(string text)
     };
 
     return keys.Any(k => t.Contains(k, StringComparison.Ordinal));
+}
+
+static bool IsAssistantMetaQuestion(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    var t = text.Trim().ToLowerInvariant();
+
+    // Keep this tiny: only identity/capability/help.
+    return t.Contains("who are you", StringComparison.Ordinal)
+           || t.Contains("what are you", StringComparison.Ordinal)
+           || t.Contains("what can you do", StringComparison.Ordinal)
+           || t.Contains("help", StringComparison.Ordinal)
+           || t.Contains("bạn là ai", StringComparison.Ordinal)
+           || t.Contains("ban la ai", StringComparison.Ordinal)
+           || t.Contains("bạn làm được gì", StringComparison.Ordinal)
+           || t.Contains("ban lam duoc gi", StringComparison.Ordinal);
 }
 
 // ======================================================================
