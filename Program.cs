@@ -753,39 +753,138 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
     if (!dict.TryGetValue("draft", out var dEl) || (dEl.ValueKind != JsonValueKind.Object && dEl.ValueKind != JsonValueKind.Null))
         dict["draft"] = JsonNull();
 
-    // If user intent is clearly actionable but model returned draft:null, synthesize a minimal draft.
+    // If user intent is clearly actionable but model returned draft:null, synthesize a minimal *action-based* draft.
+    // Important: do NOT always default to create.
     if (IsActionableIntent(userText)
         && dict.TryGetValue("draft", out var curDraft)
         && curDraft.ValueKind == JsonValueKind.Null)
     {
-        var extractedTitle = TryExtractTitleFromMessage(userText);
-        var title = string.IsNullOrWhiteSpace(extractedTitle) ? "New task (needs title)" : extractedTitle!;
+        var intent = DetectActionIntent(userText);
 
         var questions = new List<string>();
-        if (string.IsNullOrWhiteSpace(extractedTitle))
-            questions.Add("What is the task title?");
-        questions.Add("Any details for the description (expected outcome, acceptance criteria, assignees, due date)?");
+        object draftObj;
+
+        switch (intent)
+        {
+            case PmActionIntent.MoveTask:
+            {
+                var move = TryExtractMoveTaskInfo(userText);
+                var taskTitle = string.IsNullOrWhiteSpace(move.taskTitle) ? null : move.taskTitle;
+                var targetColumnName = string.IsNullOrWhiteSpace(move.toColumn) ? null : move.toColumn;
+
+                if (string.IsNullOrWhiteSpace(taskTitle))
+                    questions.Add("Which task do you want to move? (title)");
+                if (string.IsNullOrWhiteSpace(targetColumnName))
+                    questions.Add("Which column do you want to move it to? (e.g., To Do / In Progress / Done)");
+
+                draftObj = new
+                {
+                    actionType = "move_task",
+                    actionPayload = new
+                    {
+                        taskId = (string?)null,
+                        taskTitle,
+                        targetColumnId = (string?)null,
+                        targetColumnName,
+                        prevTaskId = (string?)null,
+                        nextTaskId = (string?)null
+                    }
+                };
+                break;
+            }
+
+            case PmActionIntent.DeleteTask:
+            {
+                var title = TryExtractTitleFromMessage(userText);
+                if (string.IsNullOrWhiteSpace(title))
+                    questions.Add("Which task do you want to delete? (title)");
+
+                draftObj = new
+                {
+                    actionType = "delete_task",
+                    actionPayload = new
+                    {
+                        taskId = (string?)null,
+                        taskTitle = string.IsNullOrWhiteSpace(title) ? null : title
+                    }
+                };
+                break;
+            }
+
+            case PmActionIntent.AddComment:
+            {
+                var title = TryExtractTitleFromMessage(userText);
+                var content = TryExtractQuotedText(userText);
+                if (string.IsNullOrWhiteSpace(title))
+                    questions.Add("Which task do you want to comment on? (title)");
+                if (string.IsNullOrWhiteSpace(content))
+                    questions.Add("What comment content should I add?");
+
+                draftObj = new
+                {
+                    actionType = "add_comment",
+                    actionPayload = new
+                    {
+                        taskId = (string?)null,
+                        taskTitle = string.IsNullOrWhiteSpace(title) ? null : title,
+                        content = string.IsNullOrWhiteSpace(content) ? "(comment needs content)" : content
+                    }
+                };
+                break;
+            }
+
+            case PmActionIntent.ReplaceAssignees:
+            {
+                var title = TryExtractTitleFromMessage(userText);
+                if (string.IsNullOrWhiteSpace(title))
+                    questions.Add("Which task do you want to assign people to? (title)");
+                questions.Add("Who should be assigned? (names or emails)");
+
+                draftObj = new
+                {
+                    actionType = "replace_assignees",
+                    actionPayload = new
+                    {
+                        taskId = (string?)null,
+                        taskTitle = string.IsNullOrWhiteSpace(title) ? null : title,
+                        assigneeIds = (string[]?)null,
+                        assigneeNames = (string[]?)null
+                    }
+                };
+                break;
+            }
+
+            default:
+            {
+                // Safe default for unknown actionable intent: create backlog+task (previous behavior), but with better extraction.
+                var extractedTitle = TryExtractTitleFromMessage(userText);
+                var title = string.IsNullOrWhiteSpace(extractedTitle) ? "New task (needs title)" : extractedTitle!;
+                if (string.IsNullOrWhiteSpace(extractedTitle))
+                    questions.Add("What is the task title?");
+                questions.Add("Any details for the description (expected outcome, acceptance criteria, assignees, due date)?");
+
+                draftObj = new
+                {
+                    actionType = "create_backlog_and_task",
+                    actionPayload = new
+                    {
+                        title,
+                        description = $"Context: {userText}",
+                        priority = (string?)null,
+                        dueDate = (string?)null,
+                        milestoneId = (string?)null,
+                        milestoneName = (string?)null,
+                        columnId = (string?)null,
+                        columnName = (string?)null,
+                        assigneeIds = (string[]?)null,
+                        assigneeNames = (string[]?)null
+                    }
+                };
+                break;
+            }
+        }
 
         dict["questions"] = JsonSerializer.SerializeToElement(questions.Take(3).ToArray());
-
-        var draftObj = new
-        {
-            actionType = "create_backlog_and_task",
-            actionPayload = new
-            {
-                title,
-                description = $"Context: {userText}",
-                priority = (string?)null,
-                dueDate = (string?)null,
-                milestoneId = (string?)null,
-                milestoneName = (string?)null,
-                columnId = (string?)null,
-                columnName = (string?)null,
-                assigneeIds = (string[]?)null,
-                assigneeNames = (string[]?)null
-            }
-        };
-
         dict["draft"] = JsonSerializer.SerializeToElement(draftObj, JsonOpts());
         dict["answerText"] = JsonSerializer.SerializeToElement("Got it. I drafted an action for you—please review/edit it and confirm to commit.");
     }
@@ -2507,6 +2606,25 @@ Common rules for `actionPayload`:
 - Prefer including names/titles when IDs are unknown.
 - Keep payload minimal: only fields needed for the action.
 
+Action selection hints (VERY IMPORTANT):
+- If user says "move" / "di chuyển" and mentions source/target columns (e.g., "from To Do to In Progress"), you MUST choose `move_task`.
+- If user says "add comment" / "bình luận" -> `add_comment`.
+- If user says "assign" / "phân công" -> `replace_assignees`.
+- Only choose create_* actions when user explicitly wants to create a new work item.
+
+Examples:
+User: "Move task with \"Draw Sequences Diagram - Login Function\" from To Do to In Progress"
+Draft:
+{ "actionType": "move_task", "actionPayload": { "taskId": null, "taskTitle": "Draw Sequences Diagram - Login Function", "targetColumnId": null, "targetColumnName": "In Progress", "prevTaskId": null, "nextTaskId": null } }
+
+User: "Add comment \"please add more details\" to task \"Login bug\""
+Draft:
+{ "actionType": "add_comment", "actionPayload": { "taskId": null, "taskTitle": "Login bug", "content": "please add more details" } }
+
+User: "Assign NguyenPhiHung to task \"Login flow\""
+Draft:
+{ "actionType": "replace_assignees", "actionPayload": { "taskId": null, "taskTitle": "Login flow", "assigneeIds": null, "assigneeNames": ["NguyenPhiHung"] } }
+
 Payload shapes (best-effort; unknown IDs = null):
 
 create_backlog_and_task:
@@ -2692,6 +2810,102 @@ static bool IsActionableIntent(string text)
         return true;
 
     return false;
+}
+
+static PmActionIntent DetectActionIntent(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return PmActionIntent.Unknown;
+    var t = text.Trim().ToLowerInvariant();
+
+    // Move task/card
+    if (t.Contains("move", StringComparison.Ordinal) || t.Contains("di chuyển", StringComparison.Ordinal) || t.Contains("di chuyen", StringComparison.Ordinal))
+        return PmActionIntent.MoveTask;
+
+    // Delete task
+    if (t.Contains("delete task", StringComparison.Ordinal) || t.Contains("remove task", StringComparison.Ordinal)
+        || t.Contains("xoá task", StringComparison.Ordinal) || t.Contains("xoa task", StringComparison.Ordinal) || t.Contains("xóa task", StringComparison.Ordinal))
+        return PmActionIntent.DeleteTask;
+
+    // Comment
+    if (t.Contains("add comment", StringComparison.Ordinal) || t.Contains("comment", StringComparison.Ordinal)
+        || t.Contains("bình luận", StringComparison.Ordinal) || t.Contains("binh luan", StringComparison.Ordinal))
+        return PmActionIntent.AddComment;
+
+    // Assign
+    if (t.Contains("assignee", StringComparison.Ordinal) || t.Contains("assign", StringComparison.Ordinal)
+        || t.Contains("phân công", StringComparison.Ordinal) || t.Contains("phan cong", StringComparison.Ordinal) || t.Contains("giao", StringComparison.Ordinal))
+        return PmActionIntent.ReplaceAssignees;
+
+    // Default to create flow
+    return PmActionIntent.CreateWork;
+}
+
+static (string? taskTitle, string? fromColumn, string? toColumn) TryExtractMoveTaskInfo(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return (null, null, null);
+    var raw = text.Trim();
+    var lower = raw.ToLowerInvariant();
+
+    // Title patterns: quoted, or "task with X", or "task X"
+    var title = TryExtractQuotedText(raw);
+
+    if (string.IsNullOrWhiteSpace(title))
+    {
+        var marker = "task with ";
+        var idx = lower.IndexOf(marker, StringComparison.Ordinal);
+        if (idx >= 0)
+        {
+            var start = idx + marker.Length;
+            var end = lower.IndexOf(" from ", start, StringComparison.Ordinal);
+            if (end < 0) end = raw.Length;
+            title = raw[start..end].Trim().TrimEnd('.', '!', '?');
+        }
+    }
+
+    if (string.IsNullOrWhiteSpace(title))
+    {
+        var marker = "task ";
+        var idx = lower.IndexOf(marker, StringComparison.Ordinal);
+        if (idx >= 0)
+        {
+            var start = idx + marker.Length;
+            var end = lower.IndexOf(" from ", start, StringComparison.Ordinal);
+            if (end < 0) end = raw.Length;
+            title = raw[start..end].Trim().TrimEnd('.', '!', '?');
+        }
+    }
+
+    // Columns pattern: "from X to Y"
+    string? fromCol = null;
+    string? toCol = null;
+    var fromIdx = lower.IndexOf(" from ", StringComparison.Ordinal);
+    if (fromIdx >= 0)
+    {
+        var toIdx = lower.IndexOf(" to ", fromIdx + 6, StringComparison.Ordinal);
+        if (toIdx > fromIdx)
+        {
+            fromCol = raw[(fromIdx + 6)..toIdx].Trim().TrimEnd('.', '!', '?');
+            toCol = raw[(toIdx + 4)..].Trim().TrimEnd('.', '!', '?');
+        }
+    }
+
+    return (string.IsNullOrWhiteSpace(title) ? null : title,
+            string.IsNullOrWhiteSpace(fromCol) ? null : fromCol,
+            string.IsNullOrWhiteSpace(toCol) ? null : toCol);
+}
+
+static string? TryExtractQuotedText(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return null;
+    var t = text.Trim();
+    var q1 = t.IndexOf('"');
+    if (q1 >= 0)
+    {
+        var q2 = t.IndexOf('"', q1 + 1);
+        if (q2 > q1 + 1)
+            return t.Substring(q1 + 1, q2 - q1 - 1).Trim().TrimEnd('.', '!', '?');
+    }
+    return null;
 }
 
 static string? TryExtractTitleFromMessage(string text)
@@ -2971,6 +3185,16 @@ static string NormalizeMode(string mode)
 // ======================================================================
 // DTOs
 // ======================================================================
+
+enum PmActionIntent
+{
+    Unknown,
+    MoveTask,
+    DeleteTask,
+    AddComment,
+    ReplaceAssignees,
+    CreateWork
+}
 
 record UpsertRequest(string Type, string? EntityId, string? Title, string? Text, string? SemesterId, string? MajorId, string? PointId);
 record SearchRequest(string QueryText, string? Type, string? SemesterId, string? MajorId, int Limit, double? ScoreThreshold);
