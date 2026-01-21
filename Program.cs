@@ -70,6 +70,15 @@ const double WEIGHT_PERSONAL_POST_BASE = 0.70;
 var temperature = 0.25;
 var llmModel = "qwen";
 
+// PM Assistant scope control
+// - PM_ASSISTANT_PROJECT_ONLY=true  => refuse non-Teammy/project-management topics
+// - PM_ASSISTANT_OUT_OF_SCOPE_MESSAGE / _QUESTION customize refusal
+var pmAssistantProjectOnly = GetBoolEnv("PM_ASSISTANT_PROJECT_ONLY", defaultValue: true);
+var pmAssistantOutOfScopeMessage = Environment.GetEnvironmentVariable("PM_ASSISTANT_OUT_OF_SCOPE_MESSAGE")
+    ?? "I can only help with Teammy project management (tasks/backlog/board).";
+var pmAssistantOutOfScopeQuestion = Environment.GetEnvironmentVariable("PM_ASSISTANT_OUT_OF_SCOPE_QUESTION")
+    ?? "Tell me what you want to do in Teammy (e.g., create a task, update backlog, move a card, add a comment).";
+
 // Debug
 var enableDebug = true;
 var last = new LastDebug();
@@ -662,6 +671,18 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
     if (string.IsNullOrWhiteSpace(userText))
         return Results.BadRequest(new { error = "Missing userText" });
 
+    if (pmAssistantProjectOnly && !IsProjectScopedIntent(userText))
+    {
+        var payload = new Dictionary<string, object?>
+        {
+            ["answerText"] = pmAssistantOutOfScopeMessage,
+            ["questions"] = new[] { pmAssistantOutOfScopeQuestion },
+            ["draft"] = null
+        };
+
+        return Results.Content(JsonSerializer.Serialize(payload, JsonOpts()), "application/json", Encoding.UTF8);
+    }
+
     var sys = BuildPmAssistantDraftSystemPrompt();
     var userObj = new
     {
@@ -688,8 +709,38 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
     if (outRoot.ValueKind != JsonValueKind.Object)
         return Results.Ok(new { error = "llm_invalid_or_missing_fields", detail = "root_not_object", draft = (object?)null });
 
-    // We don't content-rewrite here; just return the model JSON.
-    return Results.Content(outRoot.GetRawText(), "application/json", Encoding.UTF8);
+    // Normalize minimal contract so FE doesn't get empty chat responses.
+    // Required keys: answerText (non-empty string), questions (array), draft (object|null).
+    var dict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(outRoot.GetRawText())
+               ?? new Dictionary<string, JsonElement>();
+
+    static JsonElement JsonNull()
+    {
+        using var n = JsonDocument.Parse("null");
+        return n.RootElement.Clone();
+    }
+
+    dict.TryGetValue("answerText", out var atEl);
+    var answerText = atEl.ValueKind == JsonValueKind.String ? (atEl.GetString() ?? "") : "";
+
+    if (string.IsNullOrWhiteSpace(answerText))
+    {
+        // Only a safety fallback: do not hardcode specific intents.
+        // If the model returns an empty string, provide a generic, always-acceptable response.
+        answerText = pmAssistantProjectOnly
+            ? pmAssistantOutOfScopeMessage
+            : "I'm Teammy, your AI assistant. How can I help you today?";
+    }
+
+    dict["answerText"] = JsonSerializer.SerializeToElement(answerText);
+
+    if (!dict.TryGetValue("questions", out var qEl) || qEl.ValueKind != JsonValueKind.Array)
+        dict["questions"] = JsonSerializer.SerializeToElement(Array.Empty<string>());
+
+    if (!dict.TryGetValue("draft", out var dEl) || (dEl.ValueKind != JsonValueKind.Object && dEl.ValueKind != JsonValueKind.Null))
+        dict["draft"] = JsonNull();
+
+    return Results.Content(JsonSerializer.Serialize(dict, JsonOpts()), "application/json", Encoding.UTF8);
 });
 
 // ======================================================================
@@ -2349,6 +2400,7 @@ You must follow:
 - You do NOT have access to the user's project data here. Do NOT claim you looked up boards/tasks/milestones.
 - If missing critical info, ask at most 1–3 short questions.
 - Only propose creating/updating a work item if the user message is clearly about project work (tasks/backlog/bugs/features).
+- If the user asks about topics outside Teammy project management, refuse briefly and ask them to ask about Teammy tasks/backlog/board.
 - Prefer putting details into the field `draft.description` (string) when available.
 
 Return ONE JSON object with EXACTLY these top-level keys:
@@ -2358,7 +2410,8 @@ Return ONE JSON object with EXACTLY these top-level keys:
 
 Chatbox rule:
 - If the user message is non-actionable chat (e.g. greetings, "who are you", general questions), set `draft` to null.
-- In that case, use `answerText` to respond normally and put 0-2 clarifying questions in `questions` like: "Do you want me to create a task/backlog item for this?".
+- In that case, `answerText` MUST directly answer the user (never empty). `questions` should be empty unless you truly need clarification.
+- Do NOT ask "Do you want me to create a task?" for identity/greeting/general questions.
 
 Draft rule:
 - If the user intent IS actionable, create `draft` and (if mode is not specified) set draft.mode to "backlog-first".
@@ -2383,11 +2436,45 @@ Schema for `draft` (when draft is not null, it MUST include these keys):
 }
 
 Content rules:
+- `answerText` MUST be non-empty.
 - `title` <= 80 chars.
 - `description` should include: context / observed / expected / impact (brief). If no bug, adapt appropriately.
 - If you asked questions, still output a best-effort draft (may contain nulls).
 - Do NOT include any extra keys beyond the schema above.
 """;
+}
+
+static bool GetBoolEnv(string name, bool defaultValue)
+{
+    var v = Environment.GetEnvironmentVariable(name);
+    if (string.IsNullOrWhiteSpace(v)) return defaultValue;
+    return v.Trim().ToLowerInvariant() switch
+    {
+        "1" or "true" or "yes" or "y" or "on" => true,
+        "0" or "false" or "no" or "n" or "off" => false,
+        _ => defaultValue
+    };
+}
+
+static bool IsProjectScopedIntent(string text)
+{
+    if (string.IsNullOrWhiteSpace(text)) return false;
+    var t = text.ToLowerInvariant();
+
+    // Strong project-management keywords (EN + VI)
+    var keys = new[]
+    {
+        "teammy", "task", "tasks", "backlog", "milestone", "board", "kanban", "column", "card",
+        "assignee", "assign", "priority", "status", "due", "deadline", "bug", "feature", "chore",
+        "comment", "move", "update", "create", "ticket", "issue",
+
+        "công việc", "cong viec", "nhiệm vụ", "nhiem vu", "bảng", "bang", "cột", "cot",
+        "trạng thái", "trang thai", "ưu tiên", "uu tien", "hạn", "han", "deadline",
+        "giao", "phân công", "phan cong", "bình luận", "binh luan", "di chuyển", "di chuyen",
+        "tạo", "tao", "cập nhật", "cap nhat", "sửa", "sua", "lỗi", "loi", "tính năng", "tinh nang"
+    };
+
+    return keys.Any(k => t.Contains(k, StringComparison.Ordinal));
 }
 
 // ======================================================================
