@@ -13,6 +13,7 @@ using System.Net.Http.Json;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Nodes;
 using Microsoft.Data.Sqlite;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -895,6 +896,17 @@ app.MapPost("/llm/pm-assistant/draft", async (HttpRequest req, IHttpClientFactor
         dict["questions"] = JsonSerializer.SerializeToElement(questions.Take(3).ToArray());
         dict["draft"] = JsonSerializer.SerializeToElement(draftObj, JsonOpts());
         dict["answerText"] = JsonSerializer.SerializeToElement("Got it. I drafted an action for you—please review/edit it and confirm to commit.");
+    }
+
+    // Final pass: ensure actionPayload always has full keys + sensible defaults for FE editing.
+    if (dict.TryGetValue("draft", out var draftEl) && draftEl.ValueKind == JsonValueKind.Object)
+    {
+        var node = JsonNode.Parse(draftEl.GetRawText()) as JsonObject;
+        if (node is not null)
+        {
+            var normalized = NormalizePmDraftForUi(node, userText);
+            dict["draft"] = JsonSerializer.SerializeToElement(normalized, JsonOpts());
+        }
     }
 
     return Results.Content(JsonSerializer.Serialize(dict, JsonOpts()), "application/json", Encoding.UTF8);
@@ -2951,7 +2963,7 @@ static string? TryExtractTitleFromMessage(string text)
     var aboutIdx = lower.IndexOf(" about ", StringComparison.Ordinal);
     if (aboutIdx >= 0)
     {
-        var title = t[(aboutIdx + " about ".Length)..].Trim();
+        var title = NormalizeSpaces(t[(aboutIdx + " about ".Length)..].Trim());
 
         // Trim common trailing clauses that are not part of the task title.
         var tl = title.ToLowerInvariant();
@@ -2961,6 +2973,10 @@ static string? TryExtractTitleFromMessage(string text)
             " and put into ",
             " and add it to ",
             " and assign it to ",
+            " and put it into a new milestone",
+            " and put it into new milestone",
+            " and put it into milestone",
+            " and put it in a new milestone",
             " into a new milestone",
             " into new milestone",
             " to a new milestone",
@@ -2994,7 +3010,172 @@ static string? TryExtractTitleFromMessage(string text)
             return title.Trim().TrimEnd('.', '!', '?');
     }
 
+    // Generic English fallback: "... task X" or "... task to X".
+    // Helps for common phrasing like "delete task ABC" / "create a task to ...".
+    {
+        var taskMarker = "task ";
+        var taskIdx = lower.IndexOf(taskMarker, StringComparison.Ordinal);
+        if (taskIdx >= 0)
+        {
+            var title = NormalizeSpaces(t[(taskIdx + taskMarker.Length)..].Trim());
+            if (title.StartsWith("to ", StringComparison.OrdinalIgnoreCase))
+                title = title[3..].Trim();
+
+            var tl = title.ToLowerInvariant();
+            var cutPhrases = new[]
+            {
+                " and put it into ",
+                " and put it in ",
+                " and add it to ",
+                " and assign it to ",
+                " into a new milestone",
+                " into new milestone",
+                " in a new milestone",
+                " in new milestone",
+                " from ",
+            };
+            foreach (var p in cutPhrases)
+            {
+                var idx = tl.IndexOf(p, StringComparison.Ordinal);
+                if (idx > 0)
+                {
+                    title = title[..idx].Trim();
+                    break;
+                }
+            }
+
+            title = title.Trim().Trim('"', '\'', '“', '”');
+            if (title.Length > 0)
+                return title.Trim().TrimEnd('.', '!', '?');
+        }
+    }
+
     return null;
+}
+
+static string NormalizeSpaces(string s)
+{
+    if (string.IsNullOrEmpty(s)) return s;
+    var sb = new StringBuilder(s.Length);
+    var prevWasSpace = false;
+    foreach (var ch in s)
+    {
+        var isWs = char.IsWhiteSpace(ch);
+        if (isWs)
+        {
+            if (prevWasSpace) continue;
+            sb.Append(' ');
+            prevWasSpace = true;
+            continue;
+        }
+        sb.Append(ch);
+        prevWasSpace = false;
+    }
+    return sb.ToString().Trim();
+}
+
+static string SuggestMilestoneNameFromTitle(string title)
+{
+    var t = (title ?? "").Trim();
+    if (string.IsNullOrWhiteSpace(t))
+        return "Milestone 1";
+
+    var l = t.ToLowerInvariant();
+    if (l.Contains("diagram") || l.Contains("design") || l.Contains("architecture") || l.Contains("class"))
+        return "Design & Architecture";
+
+    return "Milestone 1";
+}
+
+static JsonObject NormalizePmDraftForUi(JsonObject draftObj, string userText)
+{
+    var actionType = draftObj["actionType"]?.GetValue<string>()?.Trim();
+    if (string.IsNullOrWhiteSpace(actionType))
+        return draftObj;
+
+    var payload = draftObj["actionPayload"] as JsonObject ?? new JsonObject();
+
+    void Ensure(string key)
+    {
+        if (!payload.ContainsKey(key))
+            payload[key] = null;
+    }
+
+    switch (actionType)
+    {
+        case "create_backlog_and_task":
+            foreach (var k in new[] { "title", "description", "priority", "dueDate", "milestoneId", "milestoneName", "milestoneDescription", "milestoneTargetDate", "columnId", "columnName", "assigneeIds", "assigneeNames" })
+                Ensure(k);
+            break;
+
+        case "create_task":
+            foreach (var k in new[] { "title", "description", "priority", "status", "dueDate", "columnId", "columnName", "assigneeIds", "assigneeNames", "backlogItemId", "backlogTitle" })
+                Ensure(k);
+            break;
+
+        case "update_task":
+            foreach (var k in new[] { "taskId", "taskTitle", "title", "description", "priority", "status", "dueDate", "columnId", "columnName", "assigneeIds", "assigneeNames" })
+                Ensure(k);
+            break;
+
+        case "delete_task":
+            foreach (var k in new[] { "taskId", "taskTitle" })
+                Ensure(k);
+            break;
+
+        case "move_task":
+            foreach (var k in new[] { "taskId", "taskTitle", "targetColumnId", "targetColumnName", "prevTaskId", "nextTaskId" })
+                Ensure(k);
+            break;
+
+        case "replace_assignees":
+            foreach (var k in new[] { "taskId", "taskTitle", "assigneeIds", "assigneeNames" })
+                Ensure(k);
+            break;
+
+        case "add_comment":
+            foreach (var k in new[] { "taskId", "taskTitle", "content" })
+                Ensure(k);
+            break;
+
+        case "delete_comment":
+            foreach (var k in new[] { "commentId" })
+                Ensure(k);
+            break;
+    }
+
+    // Best-effort generation for create flows.
+    var title = payload["title"]?.GetValue<string>()?.Trim();
+    if ((actionType is "create_task" or "create_backlog_and_task") && string.IsNullOrWhiteSpace(title))
+    {
+        var extracted = TryExtractTitleFromMessage(userText);
+        if (!string.IsNullOrWhiteSpace(extracted))
+            payload["title"] = extracted;
+    }
+
+    title = payload["title"]?.GetValue<string>()?.Trim();
+
+    if (actionType is "create_task" or "create_backlog_and_task")
+    {
+        var desc = payload["description"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(desc) && !string.IsNullOrWhiteSpace(title))
+            payload["description"] = GenerateTaskDescriptionFromTitle(title!);
+
+        var pr = payload["priority"]?.GetValue<string>();
+        if (string.IsNullOrWhiteSpace(pr))
+            payload["priority"] = "Medium";
+    }
+
+    if (actionType == "create_backlog_and_task")
+    {
+        var milestoneId = payload["milestoneId"]?.GetValue<string>();
+        var milestoneName = payload["milestoneName"]?.GetValue<string>();
+        if (MentionsNewMilestone(userText) && string.IsNullOrWhiteSpace(milestoneId) && string.IsNullOrWhiteSpace(milestoneName))
+            payload["milestoneName"] = SuggestMilestoneNameFromTitle(title ?? "");
+    }
+
+    draftObj["actionPayload"] = payload;
+    return draftObj;
 }
 
 static bool MentionsNewMilestone(string text)
