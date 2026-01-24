@@ -427,34 +427,48 @@ app.MapPost("/llm/extract-skills", async (HttpRequest req, IHttpClientFactory hf
     if (body is null || string.IsNullOrWhiteSpace(body.Text))
         return Results.BadRequest(new { error = "Missing text" });
 
+    // IMPORTANT: this endpoint must be fast & predictable.
+    // Evidence quotes make the model produce long JSON (often truncated), which slows imports.
+    // We ask for a minimal payload and then normalize to the legacy schema.
     var sys = """
 Return ONLY valid JSON. No markdown. No code fences.
-Extract skills from the text. Do NOT fabricate.
-Schema:
-{"primaryRole":"Frontend|Backend|Mobile|AI|Data|QA|DevOps|null","skills":["string"],"matchedSkills":["string"],"evidence":[{"skill":"string","quote":"string"}]}
+
+Task: extract a short list of skills mentioned in the text.
+Rules:
+- Do NOT fabricate skills.
+- Prefer items from knownSkills when they appear.
+- Return at most maxSkills items.
+- Keep each skill <= 40 characters.
+
+Return schema (ONLY these keys):
+{"primaryRole":"Frontend|Backend|Mobile|AI|Data|QA|DevOps|null","skills":["string"]}
 """;
+
+    var maxSkills = Math.Clamp(body.MaxSkills <= 0 ? 20 : body.MaxSkills, 1, 60);
+    var knownSkills = (body.KnownSkills ?? new List<string>())
+        .Where(x => !string.IsNullOrWhiteSpace(x))
+        .Select(x => x.Trim())
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Take(200)
+        .ToList();
 
     var user = JsonSerializer.Serialize(new
     {
-        maxSkills = Math.Clamp(body.MaxSkills <= 0 ? 20 : body.MaxSkills, 1, 60),
-        knownSkills = body.KnownSkills ?? new List<string>(),
-        text = Clip(body.Text!, 9000)
+        maxSkills,
+        knownSkills,
+        text = Clip(body.Text!, 6000)
     }, JsonOpts());
 
     var llm = hf.CreateClient("llm");
 
-    var call = await LlamaChatSafeAsync(llm, llmModel, sys, user, temperature: 0.2, maxTokens: 2600, llmGate, req.HttpContext.RequestAborted);
+    // Smaller token budget to keep latency bounded.
+    var call = await LlamaChatSafeAsync(llm, llmModel, sys, user, temperature: 0.0, maxTokens: 900, llmGate, req.HttpContext.RequestAborted);
     if (!call.ok)
         return Results.Json(new { ok = false, error = "llm_failed", detail = call.error, status = call.status }, statusCode: 503);
 
     var extracted = ExtractFirstCompleteJsonValue(call.content);
 
-    if (extracted is null || call.finish == "length")
-    {
-        var call2 = await LlamaChatSafeAsync(llm, llmModel, sys, user, temperature: 0.2, maxTokens: 4200, llmGate, req.HttpContext.RequestAborted);
-        if (call2.ok)
-            extracted = ExtractFirstCompleteJsonValue(call2.content);
-    }
+    // No big second pass: keep this endpoint bounded to avoid import timeouts.
 
     if (extracted is null)
         return Results.Json(new { ok = false, error = "llm_invalid_json_or_truncated" }, statusCode: 200);
@@ -464,7 +478,45 @@ Schema:
     if (!TryParseJson(extracted, out var parsed, out var err))
         return Results.Json(new { ok = false, error = "llm_invalid_json", detail = err }, statusCode: 200);
 
-    return Results.Text(parsed!.RootElement.GetRawText(), "application/json");
+    // Normalize to the legacy response schema expected by downstream code.
+    // Legacy schema:
+    // { primaryRole, skills, matchedSkills, evidence:[{skill,quote}] }
+    try
+    {
+        var root = parsed!.RootElement;
+        var role = GetStringAny(root, "primaryRole", "PrimaryRole");
+        role = string.IsNullOrWhiteSpace(role) ? null : role.Trim();
+
+        var skills = new List<string>();
+        if (TryGetArrayAny(root, out var skillsArr, "skills", "Skills"))
+        {
+            foreach (var x in skillsArr.EnumerateArray())
+            {
+                if (x.ValueKind != JsonValueKind.String) continue;
+                var s = (x.GetString() ?? "").Trim();
+                if (s.Length == 0) continue;
+                if (s.Length > 40) s = s[..40].Trim();
+                if (skills.Contains(s, StringComparer.OrdinalIgnoreCase)) continue;
+                skills.Add(s);
+                if (skills.Count >= maxSkills) break;
+            }
+        }
+
+        var normalized = new
+        {
+            primaryRole = role,
+            skills = skills.ToArray(),
+            matchedSkills = skills.ToArray(),
+            evidence = Array.Empty<object>()
+        };
+
+        return Results.Json(normalized, JsonOpts());
+    }
+    catch
+    {
+        // Fallback: at least return parsed JSON if it exists.
+        return Results.Text(parsed!.RootElement.GetRawText(), "application/json");
+    }
 });
 
 // ======================================================================
